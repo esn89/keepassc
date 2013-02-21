@@ -46,6 +46,9 @@ class Editor(object):
         box:            True/False whether to outline editor with a box
         max_text_size:  maximum rows allowed size for text.
                             Default=0 (unlimited)
+                            If initext is longer than max_text_size, then
+                            max_text_size will increase to that size so no data
+                            is lost.
         pw_mode:        True/False. Whether or not to show text entry
                             (e.g. for passwords)
 
@@ -53,10 +56,19 @@ class Editor(object):
         text:   text string  or -1 on a KeyboardInterrupt
 
     Usage:
-        import keepassc
-        keepassc.editor(box=False, inittext="Hi", win_location=(5, 5))
+        from keepassc.editor import Editor
+        Editor(box=False, inittext="Hi", win_location=(5, 5))()
 
+    TODO: fix bottom of box disappears when backspacing
     TODO: fix pageup/pagedown for single line text entry
+    TODO: x-scrolling. Enable long lines to be pasted without cutting them off.
+          - Scroll the entire screen left/right.
+          - If going up or down to a new line, jump to the end of that line and
+            scroll sideways to put the cursor at the right edge of the box if
+            the line is longer than the box.
+          - Or should I just wrap lines to stay within the visible box, but
+            don't add '\n' unless a newline is desired? This will mess with my
+            line counts for the visible box....
 
     """
 
@@ -79,16 +91,24 @@ class Editor(object):
                 pass
             curses.echo()
         locale.setlocale(locale.LC_ALL, '')
+        encoding = locale.getpreferredencoding()
         curses.use_default_colors()
-        #encoding = locale.getpreferredencoding()
         self.resize_flag = False
         self.win_location_x, self.win_location_y = win_location
         self.win_size_orig_y, self.win_size_orig_x = win_size
         self.win_size_y = self.win_size_orig_y
         self.win_size_x = self.win_size_orig_x
+        if self.win_size_y < 2 and self.max_text_size == 1:
+            # For single line windows limited to max_text_size=1, allow
+            # scrolling text in the x direction. < 2 because I can't get the
+            # extra line at the bottom of the text window to be usable.
+            self.x_scroll = True
+        else:
+            self.x_scroll = False
         self.win_init()
         self.box_init()
         self.text_init(inittext)
+        self.text_orig = self.text[:]
         self.keys_init()
         self.display()
 
@@ -121,29 +141,49 @@ class Editor(object):
             self.boxscr.refresh()
 
     def text_init(self, text):
-        """Transform text string into a list of strings, wrapped to fit the
-        window size. Sets the dimensions of the text buffer.
+        """Transform text string into a list of lists of strings, wrapped to
+        fit the window size. [['line 1','line 2'], ['line3','line4']] where
+        each sublist is a continuous line separated by \n.  Also sets the
+        dimensions of the text buffer.
 
         """
-        t = str(text).split('\n')
-        t = [wrap(i, self.win_size_x - 1) for i in t]
-        self.text = []
-        for line in t:
-            # This retains any empty lines
-            if line:
-                self.text.extend(line)
-            else:
-                self.text.append("")
-        if self.text:
-            # Sets size for text buffer...may be larger than win_size!
-            self.buffer_cols = max(self.win_size_x,
-                                   max([len(i) for i in self.text]))
-            self.buffer_rows = max(self.win_size_y, len(self.text))
-        self.text_orig = self.text[:]
-        if self.max_text_size:
-            # Truncates initial text if max_text_size < len(self.text)
-            self.text = self.text[:self.max_text_size]
-        self.buf_length = len(self.text[self.buffer_idx_y])
+        t = str(text).splitlines(True)
+        if self.x_scroll is False:
+            # Wrap text if we're not enabling x scrolling
+            self.text = [wrap(i, self.win_size_x - 1) or [""] for i in t]
+        else:
+            self.text = [t]
+        self.buffer_set()
+        if 0 < self.max_text_size < self.num_rows:
+            # Increases max_text_size if if max_text_size < num_rows
+            self.max_text_size = self.num_rows
+
+    def buffer_set(self):
+        """Set variables for the text buffer.
+
+        """
+        self.max_cols = max([len(j) for i in self.text for j in i]
+                            or [self.win_size_x])
+        self.num_rows = sum([len(i) for i in self.text])
+        self.buffer_idx_y = self.cur_pos_y + self.y_offset
+        # Create an indexable list where each row of text has an index of
+        # (line, row) within self.text, and the list is indexed from
+        # self.buffer_idx_y. Like: [(idx_line,idx_row, row), (....)]
+        self.buffer_list = []
+        idx_line = 0
+        for line in self.text:
+            idx_row = 0
+            for row in line:
+                self.buffer_list.append((idx_line, idx_row, row))
+                idx_row += 1
+            idx_line += 1
+        if not self.buffer_list:
+            self.buffer_list.append((0, 0, ""))
+        # buf_length = length of current line
+        self.buf_length = len(self.buffer_list[self.buffer_idx_y][2])
+        if self.cur_pos_x > self.buf_length:
+            self.cur_pos_x = self.buf_length
+        self.buffer_idx_x = self.cur_pos_x
 
     def keys_init(self):
         """Define methods for each key.
@@ -187,10 +227,17 @@ class Editor(object):
         # self.cur_pos is the current y,x position of the cursor
         self.cur_pos_y = 0
         self.cur_pos_x = 0
-        # y_offset controls the up-down scrolling feature
+        # y_offset controls the up-down scrolling feature, x_offset left-right
         self.y_offset = 0
+        self.x_offset = 0
+        # buffer_idx_y is the location of the current line within all of
+        # self.text. row_idx is the position within the current line
+        # line_idx is the position of the current line within self.text. So an
+        # actual line of text would be self.text[line_idx][row_idx]
         self.buffer_idx_y = 0
         self.buffer_idx_x = 0
+        self.line_idx = 0
+        self.row_idx = 0
         # Adjust win_size if resizing
         if self.resize_flag is True:
             self.win_size_x += 1
@@ -263,12 +310,12 @@ class Editor(object):
 
     def down(self):
         if (self.cur_pos_y < self.win_size_y - 1 and
-                self.buffer_idx_y < len(self.text) - 1):
+                self.buffer_idx_y < self.num_rows - 1):
             self.cur_pos_y = self.cur_pos_y + 1
-        elif self.buffer_idx_y == len(self.text) - 1:
+        elif self.buffer_idx_y == self.num_rows - 1:
             pass
         else:
-            self.y_offset = min(self.buffer_rows - self.win_size_y,
+            self.y_offset = min(self.num_rows - self.win_size_y,
                                 self.y_offset + 1)
 
     def end(self):
@@ -281,7 +328,7 @@ class Editor(object):
         self.y_offset = max(0, self.y_offset - self.win_size_y)
 
     def page_down(self):
-        self.y_offset = min(self.buffer_rows - self.win_size_y - 1,
+        self.y_offset = min(self.num_rows - self.win_size_y - 1,
                             self.y_offset + self.win_size_y)
         # Corrects negative offsets
         self.y_offset = max(0, self.y_offset)
@@ -295,10 +342,11 @@ class Editor(object):
         # certain special characters)
         if isinstance(c, int):
             return
-        line = list(self.text[self.buffer_idx_y])
+        ln, r, line = self.buffer_list[self.buffer_idx_y]
+        line = list(self.text[ln][r])
         line.insert(self.buffer_idx_x, c)
         if len(line) < self.win_size_x:
-            self.text[self.buffer_idx_y] = "".join(line)
+            self.text[ln][r] = "".join(line)
             self.cur_pos_x += 1
 
     def insert_line_or_quit(self):
@@ -310,14 +358,20 @@ class Editor(object):
         if self.max_text_size == 1:
             # Save and quit for single-line entries
             return False
-        if len(self.text) == self.max_text_size:
+        if self.num_rows == self.max_text_size:
             return
-        line = list(self.text[self.buffer_idx_y])
+        ln, r, line = self.buffer_list[self.buffer_idx_y]
+        line = list(self.text[ln][r])
         newline = line[self.cur_pos_x:]
         line = line[:self.cur_pos_x]
-        self.text[self.buffer_idx_y] = "".join(line)
-        self.text.insert(self.buffer_idx_y + 1, "".join(newline))
-        self.buffer_rows = max(self.win_size_y, len(self.text))
+        oldline1 = self.text[ln][:r]
+        oldline1.append("".join(line))
+        oldline2 = self.text[ln][r + 1:]
+        oldline2.insert(0, "".join(newline))
+        del self.text[ln]
+        self.text.insert(ln, oldline2)
+        self.text.insert(ln, oldline1)
+        self.buffer_set()
         self.cur_pos_x = 0
         self.down()
 
@@ -344,7 +398,7 @@ class Editor(object):
             elif not self.text[self.buffer_idx_y - 1]:
                 del self.text[self.buffer_idx_y - 1]
             self.up()
-        self.buffer_rows = max(self.win_size_y, len(self.text))
+        self.buffer_set()
         # Makes sure leftover rows are visually cleared if deleting rows from
         # the bottom of the text.
         self.stdscr.clear()
@@ -430,7 +484,7 @@ class Editor(object):
         self.resize_flag = True
         self.win_init()
         self.box_init()
-        self.text_init("\n".join(self.text))
+        self.text_init("\n".join([" ".join(i) for i in self.text]))
 
     def run(self):
         """Main program loop.
@@ -442,11 +496,7 @@ class Editor(object):
                 loop = self.get_key()
                 if loop is False or loop == -1:
                     break
-                self.buffer_idx_y = self.cur_pos_y + self.y_offset
-                self.buf_length = len(self.text[self.buffer_idx_y])
-                if self.cur_pos_x > self.buf_length:
-                    self.cur_pos_x = self.buf_length
-                self.buffer_idx_x = self.cur_pos_x
+                self.buffer_set()
                 self.display()
         except KeyboardInterrupt:
             self.close()
@@ -456,13 +506,13 @@ class Editor(object):
         """Display the editor window and the current contents.
 
         """
-        s = self.text[self.y_offset:(self.y_offset + self.win_size_y) or 1]
+        s = self.buffer_list[self.y_offset:(self.y_offset + self.win_size_y) or 1]
         for y, line in enumerate(s):
             try:
                 self.stdscr.move(y, 0)
                 self.stdscr.clrtoeol()
                 if not self.pw_mode:
-                    self.stdscr.addstr(y, 0, line)
+                    self.stdscr.addstr(y, 0, line[2])
             except:
                 self.close()
         self.stdscr.refresh()
@@ -485,7 +535,7 @@ class Editor(object):
         elif self.text is False:
             return False
         else:
-            return "\n".join(self.text)
+            return "\n".join([" ".join(i) for i in self.text])
 
     def close(self):
         """Exiting on keyboard interrupt or other curses display errors.
