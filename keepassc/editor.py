@@ -72,9 +72,9 @@ class Editor(object):
 
     """
 
-    def __init__(self, scr, title="", inittext=" ", win_location=(0, 0),
+    def __init__(self, scr, title="", inittext="", win_location=(0, 0),
                  win_size=(20, 80), box=True, max_text_size=0, pw_mode=False):
-        self.space_counter = 0
+        self.cur_word = self.cur_word_wrapd = ""
         self.scr = scr
         self.title = title
         self.box = box
@@ -108,7 +108,7 @@ class Editor(object):
             self.x_scroll = False
         self.win_init()
         self.box_init()
-        self.text_init(inittext or " ")  # Make sure empty string isn't passed
+        self.text_init(inittext or "")  # Make sure empty string isn't passed
         self.text_orig = self.text[:]
         self.keys_init()
         self.display()
@@ -148,10 +148,11 @@ class Editor(object):
         dimensions of the text buffer.
 
         """
-        t = str(text).splitlines(True)
+        t = str(text).splitlines(True) or [""]
         if self.x_scroll is False:
             # Wrap text if we're not enabling x scrolling
-            self.text = [wrap(i, self.win_size_x - 1) or [" "] for i in t]
+            self.text = [wrap(i, self.win_size_x - 1, drop_whitespace=False)
+                         or [""] for i in t]
         else:
             self.text = [t]
         self.buffer_set()
@@ -360,12 +361,10 @@ class Editor(object):
         Returns: cur_word
 
         """
-        text = text or ""
-        if forward is True:
-            idx = -1
-        else:
-            idx = 0
-        return text[:self.buffer_idx_x].split(' ')[idx]
+        text = text or " "
+        left = text[:self.buffer_idx_x].split(' ')[-1]
+        right = text[self.buffer_idx_x:].split(' ')[0]
+        return left + right
 
     def insert_char(self, c):
         """Given a curses wide character, insert that character in the current
@@ -379,31 +378,36 @@ class Editor(object):
         ln, r, line = self.buffer_list[self.buffer_idx_y]
         line = list(line) or [""]
         line.insert(self.buffer_idx_x, c)
+        if c == " " and line[-3] == 'z':
+            curses.endwin()
+            import pdb; pdb.set_trace()
         self.text[ln][r] = "".join(line)
-        self.space_counter = len(self.text[ln][r]) - \
-                             len(self.text[ln][r].rstrip()) + 1
-        cur_word = self.get_cur_word(self.text[ln][r])
-        self.text[ln] = wrap(" ".join(self.text[ln]), self.win_size_x - 1) or [""]
-        cur_word_wrapd = self.get_cur_word(self.text[ln][r])
-        if self.space_counter:
-            ln, r, line = self.buffer_list[self.buffer_idx_y]
-            self.text[ln][r] += " " * self.space_counter
+        ## Fix for typing new words at the end of a line
+        if (line[-1] != " " and
+                self.buffer_list[self.buffer_idx_y + 1][2][0] != " " and
+                self.buffer_idx_x == self.buf_length):
+            self.text[ln][r] += " "
+        self.cur_word = self.get_cur_word(self.text[ln][r])
+        self.text[ln] = wrap("".join(self.text[ln]), self.win_size_x - 1,
+                             drop_whitespace=False) or [""]
+        self.cur_word_wrapd = self.get_cur_word(self.text[ln][r])
         self.buffer_set()
         self.right()
-        self.word_wrap_jump(cur_word, cur_word_wrapd)
+        self.word_wrap_jump(self.cur_word, self.cur_word_wrapd)
 
     def word_wrap_jump(self, cur_word, cur_word_wrapd):
         # If current word is wrapped to previous or next line, move cursor.
-        if cur_word != cur_word_wrapd and cur_word:
-            if (self.buffer_list[self.buffer_idx_y - 1][2].endswith(cur_word) or
-                    self.buffer_list[self.buffer_idx_y - 1][2].endswith(cur_word[:-1])):
+        if cur_word != cur_word_wrapd:
+            if self.buffer_list[self.buffer_idx_y - 1][2].endswith(cur_word):
+                #self.buffer_list[self.buffer_idx_y - 1][2].endswith(cur_word[:-1])):
                 # If word is wrapped up to previous line
-                self.up()
-                self.end()
-            elif (self.buffer_list[self.buffer_idx_y][2].startswith(cur_word) or
-                    self.buffer_list[self.buffer_idx_y][2].startswith(cur_word[:-1])):
+                #self.up()
+                #self.end()
+                pass
+            elif self.buffer_list[self.buffer_idx_y][2].startswith(cur_word):
+                #self.buffer_list[self.buffer_idx_y][2].startswith(cur_word[:-1])):
                 # If word is wrapped down to next line
-                self.cur_pos_x = len(cur_word) + 1
+                self.cur_pos_x = len(cur_word)
 
     def insert_tab(self):
         """Insert 4 spaces for a tab.
@@ -444,16 +448,9 @@ class Editor(object):
 
         """
         ln, r, line = self.buffer_list[self.buffer_idx_y]
-        line = list(line)
+        line = list(line) or [""]
         if self.cur_pos_x > 0:
-            try:
-                del line[self.buffer_idx_x - 1]
-            except IndexError:
-                # Catches missing whitespace due to word wrapping
-                line.extend(list(" " * (self.space_counter or 1)))
-                del line[self.buffer_idx_x - 1]
-                self.space_counter = max(0, self.space_counter - 1)
-                line = line or [" "]
+            del line[self.buffer_idx_x - 1]
             self.text[ln][r] = "".join(line)
             self.left()
         elif self.cur_pos_x == 0 and self.buffer_idx_y > 0:
@@ -474,11 +471,14 @@ class Editor(object):
                 del self.text[ln0]
             ln = ln0
         elif self.cur_pos_x == 0 and self.buffer_idx_y == 0 and not line:
-            # If at the top and the line is empty, delete it
-            del self.text[ln]
+            # If at the top and the line is empty and it's not the last line,
+            # delete it
+            if len(self.text) > 1:
+                del self.text[ln]
             return
         cur_word = self.get_cur_word(self.text[ln][r], False)
-        self.text[ln] = wrap(" ".join(self.text[ln]), self.win_size_x -1) or [""]
+        self.text[ln] = wrap("".join(self.text[ln]), self.win_size_x -1,
+                             drop_whitespace=False) or [""]
         try:
             cur_word_wrapd = self.get_cur_word(self.text[ln][r], False)
         except IndexError:
@@ -495,7 +495,8 @@ class Editor(object):
         if line and self.cur_pos_x < len(line):
             del line[self.buffer_idx_x]
         self.text[ln][r] = "".join(line)
-        self.text[ln] = wrap(" ".join(self.text[ln]), self.win_size_x - 1) or [""]
+        self.text[ln] = wrap("".join(self.text[ln]), self.win_size_x - 1,
+                             drop_whitespace=False) or [""]
 
     def del_to_eol(self):
         """Delete from cursor to end of current line. (C-k)
@@ -571,7 +572,7 @@ class Editor(object):
         self.resize_flag = True
         self.win_init()
         self.box_init()
-        self.text_init("\n".join([" ".join(i) for i in self.text]))
+        self.text_init("\n".join(["".join(i) for i in self.text]))
 
     def run(self):
         """Main program loop.
@@ -600,7 +601,7 @@ class Editor(object):
                 self.stdscr.clrtoeol()
                 if not self.pw_mode:
                     self.stdscr.addstr(y, 0, line[2])
-                self.boxscr.addstr(0,0,"{},{},{},{}".format(self.space_counter,self.cur_pos_x, self.buffer_idx_x, self.buf_length))
+                self.boxscr.addstr(0,0,"{},{}".format(self.cur_word, self.cur_word_wrapd))
                 self.boxscr.clrtoeol()
             except:
                 self.close()
@@ -624,7 +625,7 @@ class Editor(object):
         elif self.text is False:
             return False
         else:
-            return "\n".join([" ".join(i) for i in self.text])
+            return "\n".join(["".join(i) for i in self.text])
 
     def close(self):
         """Exiting on keyboard interrupt or other curses display errors.
